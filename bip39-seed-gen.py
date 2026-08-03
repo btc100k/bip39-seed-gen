@@ -3,15 +3,22 @@
 BIP39 Dice TUI -- dice rolls to mnemonic, seed, root key, and addresses.
 
 A terminal reimplementation of the core of Ian Coleman's BIP39 tool
-(https://iancoleman.io/bip39/) with byte-for-byte compatible dice handling:
+(https://iancoleman.io/bip39/) with byte-for-byte compatible entropy
+handling for all six of his entropy types:
 
-  * dice digits 1-6 are accepted; 6 is treated as 0 (base-6 events)
-  * each event contributes bits: 0->00 1->01 2->10 3->11 4->0 5->1
+  * dice (1-6; 6 counts as 0), binary (0-1), base 6, base 10,
+    hex (0-9 a-f, case preserved for hashing, exactly as his tool),
+    and cards (rank+suit pairs like AH 7d ts; T = ten)
+  * each event contributes bits per Coleman's tables (e.g. dice/base-6:
+    0->00 1->01 2->10 3->11 4->0 5->1; cards: 5/4/2 bits per card)
   * "raw" length: the LAST multiple-of-32 bits become the entropy
   * fixed lengths (12/15/18/21/24): entropy = SHA-256 of the cleaned
-    base-6 digit string, truncated to 32*words/3 bits
+    event string (cards hash as uppercase with Unicode suit symbols,
+    byte-identical to his tool), truncated to 32*words/3 bits
   * standard BIP39 checksum / wordlist lookup, BIP39 seed (PBKDF2),
     BIP32 root key, and BIP44/49/84/custom derivation with addresses
+  * live fairness statistics (chi-squared) sized to each event type;
+    cards get rank and suit breakdowns
 
 Pure Python 3 standard library. No network access, no dependencies.
 Run it on an air-gapped machine for real keys.
@@ -19,7 +26,8 @@ Run it on an air-gapped machine for real keys.
 Usage:
     python3 bip39_dice_tui.py                # interactive TUI
     python3 bip39_dice_tui.py --selftest     # run embedded test vectors
-    python3 bip39_dice_tui.py --report --rolls 1234... [--length raw]
+    python3 bip39_dice_tui.py --report --rolls 1234... [--type dice]
+        [--length raw]
         [--passphrase X] [--tab bip84|bip49|bip44|bip32]
         [--path "m/84'/0'/0'"] [--addresses 10] [--show-private]
 """
@@ -28,7 +36,9 @@ import argparse
 import curses
 import hashlib
 import hmac
+import locale
 import math
+import re
 import struct
 import sys
 import unicodedata
@@ -335,67 +345,162 @@ def chi2_pvalue(stat: float, df: int = 5) -> float:
     p = 1.0 - _gammp(df / 2.0, stat / 2.0)
     return min(1.0, max(0.0, p))
 
-def fairness_stats(rolls: str):
-    """Face-frequency fairness stats on the raw rolls (faces 1-6).
+def _chi2_panel(title, cats, counts, n):
+    exp = n / len(cats)
+    chi2 = sum((counts.get(c, 0) - exp) ** 2 / exp for c in cats)
+    df = len(cats) - 1
+    return {"title": title, "cats": cats, "counts": counts, "n": n,
+            "expected": exp, "chi2": chi2, "df": df,
+            "p": chi2_pvalue(chi2, df)}
 
-    Returns None when there are no rolls. Uses the same math as the
-    standalone dice analyzer (chi-squared df=5 + entropy estimates).
+def fairness_stats(matched, etype):
+    """Frequency fairness stats on the matched events (case-folded).
+
+    Returns a dict with one or more chi-squared "panels" (cards get a
+    rank panel and a suit panel, which have far more statistical power
+    than 52 individual cards), plus entropy-per-event estimates.
     """
-    counts = {f: 0 for f in "123456"}
-    for c in rolls:
-        if c in counts:
-            counts[c] += 1
-    n = sum(counts.values())
+    events = [e.lower() for e in matched]
+    n = len(events)
     if n == 0:
         return None
-    exp = n / 6.0
-    chi2 = sum((counts[f] - exp) ** 2 / exp for f in counts)
-    p = chi2_pvalue(chi2)
-    probs = [counts[f] / n for f in "123456"]
-    shannon = -sum(q * math.log2(q) for q in probs if q > 0)
-    min_ent = -math.log2(max(probs))
-    hi = max("123456", key=lambda f: counts[f])
-    lo = min("123456", key=lambda f: counts[f])
+    if etype == "card":
+        rank_counts, suit_counts, card_counts = {}, {}, {}
+        for e in events:
+            rank_counts[e[0]] = rank_counts.get(e[0], 0) + 1
+            suit_counts[e[1]] = suit_counts.get(e[1], 0) + 1
+            card_counts[e] = card_counts.get(e, 0) + 1
+        panels = [
+            _chi2_panel("ranks", _CARD_ORDER, rank_counts, n),
+            _chi2_panel("suits", list("cdhs"), suit_counts, n),
+        ]
+        pmax = max(card_counts.values()) / n
+        k_for_sample = 52
+        no_repeats = max(card_counts.values()) == 1
+    else:
+        cats = {"dice": list("123456"), "binary": list("01"),
+                "base 6": list("012345"), "base 10": list("0123456789"),
+                "hex": list("0123456789abcdef")}[etype]
+        counts = {}
+        for e in events:
+            counts[e] = counts.get(e, 0) + 1
+        panels = [_chi2_panel("faces", cats, counts, n)]
+        pmax = max(counts.values()) / n
+        k_for_sample = len(cats)
+        no_repeats = False
+    shannon = 0.0
+    freq = {}
+    for e in events:
+        freq[e] = freq.get(e, 0) + 1
+    for c in freq.values():
+        q = c / n
+        shannon -= q * math.log2(q)
+    min_ent = -math.log2(pmax)
     return {
-        "n": n, "counts": counts, "expected": exp,
-        "chi2": chi2, "p": p,
+        "n": n, "etype": etype, "panels": panels,
         "shannon": shannon, "min_ent": min_ent,
         "total_min_ent": min_ent * n,
-        "hi": hi, "hi_dev": (counts[hi] - exp) / exp * 100 if exp else 0.0,
-        "lo": lo, "lo_dev": (counts[lo] - exp) / exp * 100 if exp else 0.0,
+        "fair_bits": _FAIR_BITS[etype],
+        "min_needed": 5 * k_for_sample,
+        "no_repeats": no_repeats,
     }
 
 def fairness_verdict(stats) -> str:
-    if stats["n"] < 30:
-        return ("too few rolls for a meaningful test "
-                "(~100+ recommended)")
-    if stats["p"] >= 0.05:
-        return "no evidence of bias (normal range for fair dice)"
-    if stats["p"] >= 0.01:
-        return "borderline -- possibly unlucky, possibly biased; roll more"
-    return "SUSPICIOUS -- distribution unlikely for fair dice (p < 0.01)"
+    if stats["etype"] == "card" and stats["no_repeats"] and stats["n"] > 10:
+        return ("no repeated cards -- if you are dealing through shuffled "
+                "decks (no replacement), frequency tests do not apply")
+    if stats["n"] < stats["min_needed"]:
+        return (f"too few events for a meaningful test "
+                f"(~{stats['min_needed']}+ recommended)")
+    p = min(panel["p"] for panel in stats["panels"])
+    if p >= 0.05:
+        return "no evidence of bias (normal range for a fair source)"
+    if p >= 0.01:
+        return "borderline -- possibly unlucky, possibly biased; add more"
+    return "SUSPICIOUS -- distribution unlikely for a fair source (p < 0.01)"
 
 # ======================================================================
 # BIP39
 # ======================================================================
 
-_DICE_BITS = {"0": "00", "1": "01", "2": "10", "3": "11", "4": "0", "5": "1"}
+# Entropy event types, byte-compatible with Ian Coleman's entropy.js.
+# Matchers preserve the case as typed (his regexes are /gi); bit lookup
+# folds to lowercase; the "clean" string that fixed-length mode hashes
+# keeps the typed case -- except cards, which become uppercase with
+# Unicode suit symbols, exactly as his tool does before hashing.
 
-def dice_to_events(raw: str) -> str:
-    """Filter to 1-6 and convert to base-6 events (6 -> 0). Coleman-exact."""
-    return "".join("0" if c == "6" else c for c in raw if c in "123456")
+ENTROPY_TYPES = ["dice", "binary", "base 6", "base 10", "hex", "card"]
 
-def events_to_bits(events: str) -> str:
-    return "".join(_DICE_BITS[c] for c in events)
+_MATCHER = {
+    "dice":    r"[1-6]",
+    "binary":  r"[01]",
+    "base 6":  r"[0-5]",
+    "base 10": r"[0-9]",
+    "hex":     r"[0-9A-F]",
+    "card":    r"[A2-9TJQK][CDHS]",
+}
 
-def entropy_binary(events: str, length) -> str:
-    """Return the final entropy bit string per Coleman's setMnemonicFromEntropy.
+_BASE6_BITS = {"0": "00", "1": "01", "2": "10", "3": "11", "4": "0", "5": "1"}
+_EVENT_BITS = {
+    "binary": {"0": "0", "1": "1"},
+    "dice": _BASE6_BITS,
+    "base 6": _BASE6_BITS,
+    "base 10": {"0": "000", "1": "001", "2": "010", "3": "011", "4": "100",
+                "5": "101", "6": "110", "7": "111", "8": "0", "9": "1"},
+    "hex": {format(i, "x"): format(i, "04b") for i in range(16)},
+    "card": {},  # filled below
+}
+_CARD_ORDER = ["a", "2", "3", "4", "5", "6", "7", "8", "9", "t", "j", "q", "k"]
+def _build_card_bits():
+    # Coleman's table: first 32 cards 5 bits, next 16 cards 4 bits, last 4
+    # cards 2 bits, in club/diamond/heart/spade x A..K order.
+    cards = [r + s for s in "cdhs" for r in _CARD_ORDER]
+    for i, card in enumerate(cards):
+        if i < 32:
+            _EVENT_BITS["card"][card] = format(i, "05b")
+        elif i < 48:
+            _EVENT_BITS["card"][card] = format(i - 32, "04b")
+        else:
+            _EVENT_BITS["card"][card] = format(i - 48, "02b")
+_build_card_bits()
 
-    length is 'raw' or an int in {12, 15, 18, 21, 24}.
+_SUIT_SYMBOL = {"C": "\u2663", "D": "\u2666", "H": "\u2665", "S": "\u2660"}
+_FAIR_BITS = {"dice": math.log2(6), "binary": 1.0, "base 6": math.log2(6),
+              "base 10": math.log2(10), "hex": 4.0, "card": math.log2(52)}
+_AVG_BITS = {"dice": 10 / 6, "binary": 1.0, "base 6": 10 / 6,
+             "base 10": 2.6, "hex": 4.0, "card": (32 * 5 + 16 * 4 + 4 * 2) / 52}
+
+def extract_events(raw: str, etype: str):
+    """Matched events exactly as typed (case preserved), Coleman-style."""
+    return re.findall(_MATCHER[etype], raw, re.IGNORECASE)
+
+def to_base_events(matched, etype):
+    """Dice faces 1-6 become base-6 digits (6 -> 0); other types unchanged."""
+    if etype == "dice":
+        return ["0" if e == "6" else e for e in matched]
+    return list(matched)
+
+def clean_str(base_events, etype) -> str:
+    """The display / hash string, byte-identical to Coleman's cleanStr."""
+    if etype == "card":
+        s = " ".join(base_events).upper()
+        for suit, sym in _SUIT_SYMBOL.items():
+            s = s.replace(suit, sym)
+        return s
+    return "".join(base_events)
+
+def events_to_bits(base_events, etype) -> str:
+    table = _EVENT_BITS[etype]
+    return "".join(table[e.lower()] for e in base_events)
+
+def entropy_binary(clean: str, bits: str, length) -> str:
+    """Final entropy bit string per Coleman's setMnemonicFromEntropy.
+
+    length is 'raw' or an int in {12, 15, 18, 21, 24}. Fixed lengths hash
+    the clean string (UTF-8, matching sjcl's handling of JS strings).
     """
-    bits = events_to_bits(events)
     if length != "raw":
-        digest = sha256(events.encode("ascii"))
+        digest = sha256(clean.encode("utf-8"))
         bits = bin(int.from_bytes(digest, "big"))[2:].zfill(256)
         bits = bits[: 32 * int(length) // 3]
     use = (len(bits) // 32) * 32
@@ -544,25 +649,27 @@ def default_path(tab: str) -> str:
         return "m/0"
     return f"m/{TABS[tab]['purpose']}/0'/0'"
 
-def compute(rolls: str, length, passphrase: str, tab: str,
+def compute(raw: str, etype: str, length, passphrase: str, tab: str,
             custom_path: str, n_addresses: int):
     """Return a dict with every derived field, or partial dict + error."""
-    out = {"error": None}
-    events = dice_to_events(rolls)
-    bits = events_to_bits(events)
-    out["events"] = events
-    out["event_count"] = len(events)
-    out["ignored"] = len("".join(rolls.split())) - sum(
-        1 for c in rolls if c in "123456")
+    out = {"error": None, "etype": etype}
+    matched = extract_events(raw, etype)
+    base_events = to_base_events(matched, etype)
+    clean = clean_str(base_events, etype)
+    bits = events_to_bits(base_events, etype)
+    consumed = sum(len(e) for e in matched)
+    out["events"] = clean
+    out["event_count"] = len(matched)
+    out["ignored"] = sum(1 for c in raw if not c.isspace()) - consumed
     out["bits"] = bits
     out["bit_count"] = len(bits)
-    out["fairness"] = fairness_stats(rolls)
+    out["fairness"] = fairness_stats(matched, etype)
 
-    binstr = entropy_binary(events, length)
+    binstr = entropy_binary(clean, bits, length)
     out["entropy_bits_used"] = binstr
     if not binstr:
-        out["error"] = ("need more rolls: at least 32 bits of entropy "
-                        "(about 13 rolls) before any words appear")
+        out["error"] = ("need more entropy: at least 32 bits "
+                        "before any words appear (keep going)")
         return out
     if length != "raw" and len(binstr) != 32 * int(length) // 3:
         out["error"] = "internal: unexpected entropy width"
@@ -626,14 +733,19 @@ def report_lines(state, width=76, show_private=False):
     L = []
     add = L.append
     err = state.get("error")
+    etype = state.get("etype", "dice")
     add("ENTROPY")
-    add(f"    events (base 6, dice 6->0): {state['event_count']}"
-        + (f"   [{state['ignored']} non-dice chars ignored]"
+    label = {"dice": "dice rolls (6 counts as 0)", "binary": "binary digits",
+             "base 6": "base-6 digits", "base 10": "decimal digits",
+             "hex": "hex digits", "card": "cards"}[etype]
+    add(f"    {label}: {state['event_count']}"
+        + (f"   [{state['ignored']} unrecognized chars ignored]"
            if state.get("ignored") else ""))
     if state["events"]:
         L += wrap(state["events"], width - 4)
     add(f"    total bits collected: {state['bit_count']}"
-        f"   (~2.585 max per roll; this encoding averages ~2.58)")
+        f"   (this encoding averages ~{_AVG_BITS[etype]:.2f} bits/event; "
+        f"log2 max {_FAIR_BITS[etype]:.2f})")
     add("    raw binary:")
     L += wrap(state["bits"] or "(none)", width - 4)
     if not err:
@@ -642,23 +754,27 @@ def report_lines(state, width=76, show_private=False):
     fs = state.get("fairness")
     if fs:
         add("")
-        add("FAIRNESS (chi-squared goodness of fit, df = 5)")
-        bar_max = max(fs["counts"].values()) or 1
-        bar_w = max(10, min(30, width - 40))
-        for f in "123456":
-            cnt = fs["counts"][f]
-            pct = 100.0 * cnt / fs["n"]
-            dev = (cnt - fs["expected"]) / fs["expected"] * 100
-            bar = "#" * max(1 if cnt else 0,
-                            round(bar_w * cnt / bar_max))
-            add(f"    {f} | {cnt:4d}  {pct:5.1f}%  {dev:+6.1f}%  {bar}")
-        add(f"    rolls: {fs['n']}   expected/face: {fs['expected']:.1f}"
-            f"   chi2: {fs['chi2']:.3f}   p-value: {fs['p']:.4f}")
-        add(f"    over: face {fs['hi']} ({fs['hi_dev']:+.1f}%)"
-            f"   under: face {fs['lo']} ({fs['lo_dev']:+.1f}%)")
+        add("FAIRNESS (chi-squared goodness of fit)")
+        bar_w = max(10, min(30, width - 44))
+        for panel in fs["panels"]:
+            if len(fs["panels"]) > 1:
+                add(f"    by {panel['title']} (df = {panel['df']}):")
+            bar_max = max((panel["counts"].get(c, 0)
+                           for c in panel["cats"]), default=0) or 1
+            for c in panel["cats"]:
+                cnt = panel["counts"].get(c, 0)
+                pct = 100.0 * cnt / panel["n"]
+                dev = (cnt - panel["expected"]) / panel["expected"] * 100
+                bar = "#" * round(bar_w * cnt / bar_max)
+                add(f"    {c.upper():>2} | {cnt:4d}  {pct:5.1f}%  "
+                    f"{dev:+6.1f}%  {bar}")
+            add(f"       events: {panel['n']}   expected/cat: "
+                f"{panel['expected']:.1f}   chi2: {panel['chi2']:.3f}"
+                f"   df: {panel['df']}   p-value: {panel['p']:.4f}")
         add(f"    verdict: {fairness_verdict(fs)}")
-        add(f"    entropy/roll: Shannon {fs['shannon']:.4f}, "
-            f"min-entropy {fs['min_ent']:.4f} (fair max 2.5850)")
+        add(f"    entropy/event: Shannon {fs['shannon']:.4f}, "
+            f"min-entropy {fs['min_ent']:.4f} "
+            f"(fair max {fs['fair_bits']:.4f})")
         add(f"    total min-entropy: ~{fs['total_min_ent']:.0f} bits"
             f"   (>= 256 for a full-strength 24-word seed: "
             f"{'YES' if fs['total_min_ent'] >= 256 else 'not yet'})")
@@ -767,6 +883,51 @@ def selftest():
     check("pub decompress roundtrip",
           _pub_decompress(pub)[0], _G[0])
 
+    # Coleman-equivalence regressions: expected mnemonics generated by
+    # running the VERBATIM entropy.js + sjcl extracted from iancoleman.io's
+    # tool (all six entropy types, raw and hashed length modes).
+    _COLEMAN_VECTORS = [
+        ('10110100111000101011010011100010',
+         'raw', 'binary',
+         'reject between decade'),
+        ('101101001110001010110100111000101',
+         '12', 'binary',
+         'message neutral dismiss push shoot country consider wash enemy proud inhale tell'),
+        ('054321054321054321054321054',
+         'raw', 'base 6',
+         'rice inch tool'),
+        ('9876543210987654321098765',
+         '15', 'base 10',
+         'vague intact knife tunnel spare banana beauty oval radar dog valve advance double aunt will'),
+        ('DeadBeefCafeF00dDeadBeefCafeF00d',
+         'raw', 'hex',
+         'team hospital room nominee upper alone kingdom result used fitness rose bottom'),
+        ('deadbeefcafef00d',
+         '18', 'hex',
+         'garlic swarm canal mandate train uniform echo drop laundry winter card ghost fan shaft discover spend donor random'),
+        ('ah7dtskcqs2c9hjd3s8cadth5d6s4hkd2s7c9d',
+         'raw', 'card',
+         'bargain top hawk degree toward helmet'),
+        ('AH 7d Ts kC qs 2c 9h jd 3s 8c ad th',
+         '12', 'card',
+         'ribbon child thank face chaos double hard indicate foot road polar twin'),
+        ('415263142536241531642534163425',
+         'raw', 'dice',
+         'music easy essence'),
+        ('415263142536241531642534163425',
+         '24', 'dice',
+         'clown erase brisk egg sketch initial under audit luxury voyage undo ancient copy cheap will parrot apart wall since arena calm panther kitten gravity'),
+    ]
+    for raw, length, etype, want in _COLEMAN_VECTORS:
+        L = length if length == "raw" else int(length)
+        matched = extract_events(raw, etype)
+        base_events = to_base_events(matched, etype)
+        clean = clean_str(base_events, etype)
+        bits = events_to_bits(base_events, etype)
+        binstr = entropy_binary(clean, bits, L)
+        got = " ".join(binstr_to_mnemonic(binstr)[1])
+        check(f"coleman {etype} {length}", got, want)
+
     # Chi-squared p-value (verified against scipy to ~1e-15 in development;
     # 7.890 / p=0.1624 is the reference case from real 182-roll data)
     check("chi2 p(7.890, df=5)", round(chi2_pvalue(7.890), 4), 0.1624)
@@ -780,11 +941,30 @@ def selftest():
 # TUI
 # ======================================================================
 
-FIELD_ROLLS, FIELD_LENGTH, FIELD_PASS, FIELD_TAB, FIELD_PATH = range(5)
+(FIELD_TYPE, FIELD_ROLLS, FIELD_LENGTH, FIELD_PASS, FIELD_TAB,
+ FIELD_PATH) = range(6)
+
+_INPUT_CHARS = {
+    "dice": set("123456 "),
+    "binary": set("01 "),
+    "base 6": set("012345 "),
+    "base 10": set("0123456789 "),
+    "hex": set("0123456789abcdefABCDEF "),
+    "card": set("a23456789tjqkcdhsA23456789TJQKCDHS "),
+}
+_INPUT_LABEL = {
+    "dice": "Dice rolls (1-6) ",
+    "binary": "Binary (0-1)     ",
+    "base 6": "Base 6 (0-5)     ",
+    "base 10": "Base 10 (0-9)    ",
+    "hex": "Hex (0-9 a-f)    ",
+    "card": "Cards (ah 7d ts) ",
+}
 
 class Tui:
     def __init__(self):
         self.rolls = ""
+        self.etype_i = 0                  # index into ENTROPY_TYPES
         self.length_i = 0                 # index into LENGTHS
         self.passphrase = ""
         self.tab_i = 0                    # index into TAB_ORDER
@@ -801,6 +981,10 @@ class Tui:
     @property
     def length(self):
         return LENGTHS[self.length_i]
+
+    @property
+    def etype(self):
+        return ENTROPY_TYPES[self.etype_i]
 
     @property
     def tab(self):
@@ -832,7 +1016,8 @@ class Tui:
 
     # ---- input ----
     def visible_fields(self):
-        fields = [FIELD_ROLLS, FIELD_LENGTH, FIELD_PASS, FIELD_TAB]
+        fields = [FIELD_TYPE, FIELD_ROLLS, FIELD_LENGTH, FIELD_PASS,
+                  FIELD_TAB]
         if self.tab == "bip32":
             fields.append(FIELD_PATH)
         return fields
@@ -860,6 +1045,10 @@ class Tui:
             self.scroll = max(0, self.scroll - 1)
         elif ch == curses.KEY_DOWN:
             self.scroll += 1
+        elif self.focus == FIELD_TYPE and ch in (curses.KEY_LEFT,
+                                                 curses.KEY_RIGHT):
+            step = 1 if ch == curses.KEY_RIGHT else -1
+            self.etype_i = (self.etype_i + step) % len(ENTROPY_TYPES)
         elif self.focus == FIELD_LENGTH and ch in (curses.KEY_LEFT,
                                                    curses.KEY_RIGHT):
             step = 1 if ch == curses.KEY_RIGHT else -1
@@ -887,11 +1076,13 @@ class Tui:
                 self.cursor = len(text)
             elif 32 <= ch < 127:
                 c = chr(ch)
-                if self.focus == FIELD_ROLLS and c not in "123456 ":
-                    curses.beep()
+                if (self.focus == FIELD_ROLLS
+                        and c not in _INPUT_CHARS[self.etype]):
+                    try:
+                        curses.beep()
+                    except curses.error:
+                        pass
                     return
-                if c == " " and self.focus == FIELD_ROLLS:
-                    return                                # ignore spaces
                 text = text[:self.cursor] + c + text[self.cursor:]
                 self.cursor += 1
             self.set_field_text(self.focus, text)
@@ -900,7 +1091,7 @@ class Tui:
     def draw(self, scr, pending=False):
         scr.erase()
         h, w = scr.getmaxyx()
-        if h < 14 or w < 46:
+        if h < 15 or w < 46:
             scr.addstr(0, 0, "terminal too small")
             scr.refresh()
             return
@@ -929,16 +1120,18 @@ class Tui:
             if focused and field in (FIELD_ROLLS, FIELD_PASS, FIELD_PATH):
                 cursor_pos = (y, min(x + self.cursor, w - 2))
 
-        field_line(1, "Dice rolls (1-6):", self.rolls, FIELD_ROLLS)
-        field_line(2, "Mnemonic length :", str(self.length), FIELD_LENGTH,
+        field_line(1, "Entropy type    :", self.etype, FIELD_TYPE,
+                   "</> dice binary base6 base10 hex card")
+        field_line(2, _INPUT_LABEL[self.etype] + ":", self.rolls, FIELD_ROLLS)
+        field_line(3, "Mnemonic length :", str(self.length), FIELD_LENGTH,
                    "</> raw 12 15 18 21 24")
-        field_line(3, "BIP39 passphrase:", self.passphrase, FIELD_PASS)
-        field_line(4, "Derivation      :", TABS[self.tab]["label"], FIELD_TAB,
+        field_line(4, "BIP39 passphrase:", self.passphrase, FIELD_PASS)
+        field_line(5, "Derivation      :", TABS[self.tab]["label"], FIELD_TAB,
                    "</> to change")
-        row = 5
+        row = 6
         if self.tab == "bip32":
-            field_line(5, "Custom path     :", self.custom_path, FIELD_PATH)
-            row = 6
+            field_line(6, "Custom path     :", self.custom_path, FIELD_PATH)
+            row = 7
         put(row, 0, "-" * (w - 1), dim)
         put(row + 0, 2, " Tab:next field  ^P:show/hide private  ^A/^X:rows"
                         "  arrows/PgUp/PgDn:scroll  q:quit ", dim)
@@ -1028,8 +1221,8 @@ class Tui:
         return table.get(seq, -1)
 
     def _inputs_key(self):
-        return (self.rolls, self.length, self.passphrase, self.tab,
-                self.custom_path, self.n_addresses)
+        return (self.rolls, self.etype, self.length, self.passphrase,
+                self.tab, self.custom_path, self.n_addresses)
 
     def run(self, scr):
         curses.use_default_colors()
@@ -1064,12 +1257,16 @@ class Tui:
 # ======================================================================
 
 def main():
+    locale.setlocale(locale.LC_ALL, "")
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     ap.add_argument("--selftest", action="store_true",
                     help="run embedded official test vectors and exit")
     ap.add_argument("--report", action="store_true",
                     help="non-interactive: print full report and exit")
-    ap.add_argument("--rolls", default="", help="dice rolls, digits 1-6")
+    ap.add_argument("--rolls", default="",
+                    help="entropy events (dice digits, bits, hex, cards...)")
+    ap.add_argument("--type", default="dice", choices=ENTROPY_TYPES,
+                    dest="etype", help="entropy type (default dice)")
     ap.add_argument("--length", default="raw",
                     help="raw, 12, 15, 18, 21 or 24 (default raw)")
     ap.add_argument("--passphrase", default="", help="BIP39 passphrase")
@@ -1091,13 +1288,15 @@ def main():
         sys.exit("length must be raw, 12, 15, 18, 21 or 24")
 
     if args.report:
-        state = compute(args.rolls, length, args.passphrase, args.tab,
-                        args.path, args.addresses)
+        state = compute(args.rolls, args.etype, length, args.passphrase,
+                        args.tab, args.path, args.addresses)
         print("\n".join(report_lines(state, show_private=args.show_private)))
         return
 
     tui = Tui()
-    tui.rolls = "".join(c for c in args.rolls if c in "123456")
+    tui.etype_i = ENTROPY_TYPES.index(args.etype)
+    tui.rolls = "".join(c for c in args.rolls
+                        if c in _INPUT_CHARS[args.etype])
     tui.length_i = LENGTHS.index(length)
     tui.passphrase = args.passphrase
     tui.tab_i = TAB_ORDER.index(args.tab)
